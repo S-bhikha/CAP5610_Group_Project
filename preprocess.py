@@ -3,6 +3,10 @@
 
 Layout matches Testing/: Enhanced_Training/<class>/*.png|jpg|jpeg
 Source defaults to Training/ with the same per-class subfolders.
+
+By default, 30% of each class (pre-augmentation) is copied unchanged to
+Enhanced_Eval/ for validation; the remaining 70% is augmented into
+Enhanced_Training/ so train/val do not share rotation/mirror duplicates.
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ from pathlib import Path
 from typing import Callable, List, Tuple
 
 from PIL import Image, ImageOps
+from sklearn.model_selection import train_test_split
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
@@ -77,20 +82,47 @@ def _is_image_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in IMAGE_EXTS
 
 
-def augment_class_folder(
+def _split_train_eval_paths(
     src_class_dir: Path,
+    eval_fraction: float,
+    seed: int,
+) -> Tuple[List[Path], List[Path]]:
+    """Split image paths into (train_augment, eval_holdout). Per-class stratification."""
+    paths = sorted(p for p in src_class_dir.iterdir() if _is_image_file(p))
+    if not paths:
+        return [], []
+    if len(paths) == 1:
+        # Keep the only sample for augmented training; nothing for eval
+        return paths, []
+    train_p, eval_p = train_test_split(
+        paths,
+        test_size=eval_fraction,
+        random_state=seed,
+        shuffle=True,
+    )
+    return list(train_p), list(eval_p)
+
+
+def copy_eval_images(paths: List[Path], dst_class_dir: Path) -> int:
+    """Copy originals (no augmentation) into Enhanced_Eval. Returns files written."""
+    dst_class_dir.mkdir(parents=True, exist_ok=True)
+    for p in paths:
+        shutil.copy2(p, dst_class_dir / p.name)
+    return len(paths)
+
+
+def augment_paths(
+    paths: List[Path],
     dst_class_dir: Path,
     augmentations: List[Tuple[str, AugmentFn]],
     exif_transpose: bool,
 ) -> Tuple[int, int]:
-    """Copy originals and write augmented variants. Returns (n_sources, n_written)."""
+    """Copy originals and write augmented variants for the given paths. Returns (n_sources, n_written)."""
     dst_class_dir.mkdir(parents=True, exist_ok=True)
     n_sources = 0
     n_written = 0
 
-    for entry in sorted(src_class_dir.iterdir()):
-        if not _is_image_file(entry):
-            continue
+    for entry in sorted(paths, key=lambda p: p.name):
         n_sources += 1
 
         with Image.open(entry) as img:
@@ -102,7 +134,6 @@ def augment_class_folder(
             else:
                 work = base.convert("L")
 
-        # Original (same basename as Training)
         out_orig = dst_class_dir / entry.name
         work.save(out_orig)
         n_written += 1
@@ -117,6 +148,17 @@ def augment_class_folder(
     return n_sources, n_written
 
 
+def augment_class_folder(
+    src_class_dir: Path,
+    dst_class_dir: Path,
+    augmentations: List[Tuple[str, AugmentFn]],
+    exif_transpose: bool,
+) -> Tuple[int, int]:
+    """Augment every image under src_class_dir (legacy: no train/eval split)."""
+    paths = sorted(p for p in src_class_dir.iterdir() if _is_image_file(p))
+    return augment_paths(paths, dst_class_dir, augmentations, exif_transpose)
+
+
 def run_augmentation(
     data_root: Path,
     source_name: str,
@@ -127,9 +169,14 @@ def run_augmentation(
     rotate_step: int | None,
     no_flips: bool,
     dry_run: bool,
+    eval_dest_name: str,
+    eval_fraction: float,
+    split_seed: int,
+    no_eval_split: bool,
 ) -> None:
     src_root = data_root / source_name
     dst_root = data_root / dest_name
+    eval_root = data_root / eval_dest_name
 
     if not src_root.is_dir():
         raise FileNotFoundError(f"Source folder not found: {src_root}")
@@ -147,31 +194,76 @@ def run_augmentation(
         enable_flips=not no_flips,
     )
     total_src = total_out = 0
+    total_eval = 0
 
     for cls in classes:
         src_dir = src_root / cls
         dst_dir = dst_root / cls
+        eval_dir = eval_root / cls
         if not src_dir.is_dir():
             print(f"Warning: skip missing class folder -> {src_dir}")
             continue
 
-        if dry_run:
-            n = sum(1 for p in src_dir.iterdir() if _is_image_file(p))
-            would = n * (1 + len(augmentations))
-            print(f"[dry-run] {cls}: {n} images -> {would} files -> {dst_dir}")
-            total_src += n
-            total_out += would
+        if no_eval_split:
+            if dry_run:
+                n = sum(1 for p in src_dir.iterdir() if _is_image_file(p))
+                would = n * (1 + len(augmentations))
+                print(f"[dry-run] {cls}: {n} images -> {would} augmented files -> {dst_dir}")
+                total_src += n
+                total_out += would
+                continue
+
+            n_src, n_w = augment_class_folder(src_dir, dst_dir, augmentations, exif_transpose)
+            print(f"{cls}: {n_src} source images -> {n_w} files -> {dst_dir}")
+            total_src += n_src
+            total_out += n_w
             continue
 
-        n_src, n_w = augment_class_folder(src_dir, dst_dir, augmentations, exif_transpose)
-        print(f"{cls}: {n_src} source images -> {n_w} files written -> {dst_dir}")
-        total_src += n_src
+        train_paths, eval_paths = _split_train_eval_paths(src_dir, eval_fraction, split_seed)
+
+        if dry_run:
+            n_train = len(train_paths)
+            n_eval = len(eval_paths)
+            would_train = n_train * (1 + len(augmentations))
+            print(
+                f"[dry-run] {cls}: {n_train + n_eval} source "
+                f"({n_train} train augment / {n_eval} eval holdout) -> "
+                f"{would_train} train files, {n_eval} eval files"
+            )
+            total_src += n_train + n_eval
+            total_out += would_train
+            total_eval += n_eval
+            continue
+
+        n_ev = copy_eval_images(eval_paths, eval_dir)
+        total_eval += n_ev
+        if not train_paths:
+            print(f"{cls}: 0 train images after split (skipped augment); {n_ev} eval files -> {eval_dir}")
+            continue
+
+        n_src, n_w = augment_paths(train_paths, dst_dir, augmentations, exif_transpose)
+        print(
+            f"{cls}: augment {n_src} train images -> {n_w} files -> {dst_dir}; "
+            f"{n_ev} eval originals -> {eval_dir}"
+        )
+        total_src += n_src + n_ev
         total_out += n_w
 
     if dry_run:
-        print(f"Total: {total_src} source images -> {total_out} files (dry-run)")
+        if no_eval_split:
+            print(f"Total: {total_src} source images -> {total_out} augmented files (dry-run)")
+        else:
+            print(
+                f"Total: {total_src} source images -> {total_out} train augmented files, "
+                f"{total_eval} eval files (dry-run)"
+            )
+    elif no_eval_split:
+        print(f"Total: {total_src} source images -> {total_out} files under {dst_root}")
     else:
-        print(f"Total: {total_src} source images -> {total_out} files written under {dst_root}")
+        print(
+            f"Total: train augment wrote under {dst_root}; "
+            f"{total_eval} eval originals under {eval_root}"
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -233,6 +325,28 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print counts only; do not write files",
     )
+    p.add_argument(
+        "--eval-dest",
+        default="Enhanced_Eval",
+        help="Folder for validation holdout (pre-augmentation copies). Default: Enhanced_Eval",
+    )
+    p.add_argument(
+        "--eval-fraction",
+        type=float,
+        default=0.3,
+        help="Fraction of each class held out for Enhanced_Eval before augmentation. Default: 0.3",
+    )
+    p.add_argument(
+        "--split-seed",
+        type=int,
+        default=42,
+        help="Random seed for train/eval split (match notebook SEED). Default: 42",
+    )
+    p.add_argument(
+        "--no-eval-split",
+        action="store_true",
+        help="Put all source images into augmented train folder only (old behavior; no Enhanced_Eval).",
+    )
     return p.parse_args()
 
 
@@ -241,9 +355,17 @@ def main() -> None:
     data_root = args.data_root.resolve()
 
     dst = data_root / args.dest
-    if args.clear_dest and dst.exists() and not args.dry_run:
-        shutil.rmtree(dst)
-        print(f"Removed existing {dst}")
+    eval_dst = data_root / args.eval_dest
+    if args.clear_dest and not args.dry_run:
+        if dst.exists():
+            shutil.rmtree(dst)
+            print(f"Removed existing {dst}")
+        if not args.no_eval_split and eval_dst.exists():
+            shutil.rmtree(eval_dst)
+            print(f"Removed existing {eval_dst}")
+
+    if not args.no_eval_split and (args.eval_fraction <= 0 or args.eval_fraction >= 1):
+        raise ValueError("--eval-fraction must be strictly between 0 and 1 (or use --no-eval-split)")
 
     run_augmentation(
         data_root=data_root,
@@ -255,6 +377,10 @@ def main() -> None:
         rotate_step=args.rotate_step,
         no_flips=args.no_flips,
         dry_run=args.dry_run,
+        eval_dest_name=args.eval_dest,
+        eval_fraction=args.eval_fraction,
+        split_seed=args.split_seed,
+        no_eval_split=args.no_eval_split,
     )
 
 
